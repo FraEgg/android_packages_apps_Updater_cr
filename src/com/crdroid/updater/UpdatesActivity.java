@@ -15,11 +15,15 @@
  */
 package com.crdroid.updater;
 
+import android.Manifest;
+import android.app.Activity;
 import android.content.BroadcastReceiver;
 import android.content.ComponentName;
 import android.content.Context;
+import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.pm.PackageManager;
 import android.content.ServiceConnection;
 import android.content.SharedPreferences;
 import android.icu.text.DateFormat;
@@ -46,7 +50,9 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import androidx.appcompat.app.AlertDialog;
+import androidx.appcompat.app.AppCompatActivity;
 import androidx.appcompat.widget.Toolbar;
+import androidx.core.content.ContextCompat;
 import androidx.localbroadcastmanager.content.LocalBroadcastManager;
 import androidx.preference.PreferenceManager;
 import androidx.recyclerview.widget.LinearLayoutManager;
@@ -63,13 +69,18 @@ import com.crdroid.updater.controller.UpdaterService;
 import com.crdroid.updater.download.DownloadClient;
 import com.crdroid.updater.misc.BuildInfoUtils;
 import com.crdroid.updater.misc.Constants;
+import com.crdroid.updater.misc.FileUtils;
+import com.crdroid.updater.misc.PermissionsUtils;
 import com.crdroid.updater.misc.StringGenerator;
 import com.crdroid.updater.misc.Utils;
+import com.crdroid.updater.model.Update;
 import com.crdroid.updater.model.UpdateInfo;
+import com.crdroid.updater.model.UpdateStatus;
 
 import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -86,11 +97,22 @@ public class UpdatesActivity extends UpdatesListActivity {
     private View mRefreshIconView;
     private RotateAnimation mRefreshAnimation;
 
+    private static final int READ_REQUEST_CODE = 42;
+    private static final int PERMISSION_REQUEST_CODE = 200;
+
     private static Map<String, String> sf_mirrors;
+
+    // Storage Permissions
+    private static final int STORAGE_PERMISSIONS_REQUEST_CODE = 0;
+    private static final String[] REQUIRED_STORAGE_PERMISSIONS = new String[]{
+            Manifest.permission.READ_EXTERNAL_STORAGE,
+            Manifest.permission.WRITE_EXTERNAL_STORAGE
+    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+
         setContentView(R.layout.activity_updates);
 
         RecyclerView recyclerView = (RecyclerView) findViewById(R.id.recycler_view);
@@ -367,6 +389,15 @@ public class UpdatesActivity extends UpdatesListActivity {
             }
             case R.id.menu_sf_mirrors: {
                 showSfMirrorPreferencesDialog();
+                return true;
+            }
+            case R.id.menu_local_update: {
+                boolean hasPermission = PermissionsUtils.checkAndRequestPermissions(
+                      this, REQUIRED_STORAGE_PERMISSIONS,
+                      STORAGE_PERMISSIONS_REQUEST_CODE);
+                if (hasPermission) {
+                  performFileSearch();
+                }
                 return true;
             }
         }
@@ -757,5 +788,123 @@ public class UpdatesActivity extends UpdatesListActivity {
                         .putBoolean(Constants.PREF_SF_RANK_SORT, sf_rank_sort.isChecked())
                         .apply())
                 .show();
+    }
+
+    private void performFileSearch() {
+        if (checkStoragePermissions()) {
+            return;
+        }
+        Intent chooseFile;
+        Intent intent;
+        chooseFile = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        chooseFile.setType("application/zip");
+        intent = Intent.createChooser(chooseFile, "Choose a file");
+        startActivityForResult(intent, READ_REQUEST_CODE);
+    }
+
+    private boolean hasStoragePermission() {
+        int result = checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE);
+        return result == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private boolean checkStoragePermissions() {
+        if (hasStoragePermission()) {
+            return false;
+        }
+
+        final String[] perms = {Manifest.permission.READ_EXTERNAL_STORAGE};
+        requestPermissions(perms, PERMISSION_REQUEST_CODE);
+        return true;
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String permissions[], int[] grantResults) {
+        switch (requestCode) {
+            case PERMISSION_REQUEST_CODE:
+                if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                } else {
+                        if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE)
+                                != PackageManager.PERMISSION_GRANTED) {
+                            showMessageOKCancel(getString(R.string.dialog_permissions_title),
+                                    new DialogInterface.OnClickListener() {
+                                        @Override
+                                        public void onClick(DialogInterface dialog, int which) {
+                                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                                                checkStoragePermissions();
+                                            }
+                                        }
+                                    });
+                        }
+                }
+                break;
+        }
+    }
+
+    private void showMessageOKCancel(String message, DialogInterface.OnClickListener okListener) {
+        new AlertDialog.Builder(this)
+                .setMessage(message)
+                .setPositiveButton(getString(R.string.dialog_permissions_ask), okListener)
+                .setNegativeButton(getString(R.string.dialog_permissions_dismiss), null)
+                .create()
+                .show();
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent resultData) {
+        if (requestCode == READ_REQUEST_CODE && resultCode == Activity.RESULT_OK) {
+            Uri uri = null;
+            if (resultData != null) {
+                uri = resultData.getData();
+                addLocalUpdateInfo(uri);
+            }
+        }
+        super.onActivityResult(requestCode, resultCode, resultData);
+    }
+
+    private void addLocalUpdateInfo(Uri uri) {
+        String path = FileUtils.getRealPath(this, uri);
+        Update localUpdate = new Update();
+        File file = new File(path);
+        localUpdate.setFile(file);
+        localUpdate.setName(file.getName());
+        localUpdate.setFileSize(file.length());
+        localUpdate.setTimestamp(new Date().getTime()/1000L);
+        localUpdate.setDownloadId(String.valueOf(new Date().getTime()/1000L));
+        localUpdate.setVersion("");
+        localUpdate.setPersistentStatus(UpdateStatus.Persistent.LOCAL);
+        localUpdate.setStatus(UpdateStatus.DOWNLOADED);
+
+        Log.d(TAG, "Adding local updates");
+        UpdaterController controller = mUpdaterService.getUpdaterController();
+        boolean newUpdates = false;
+
+        List<UpdateInfo> updates = new ArrayList<>();
+        updates.add(localUpdate);
+        List<String> updatesOnline = new ArrayList<>();
+        for (UpdateInfo update : updates) {
+            newUpdates |= controller.addUpdate(update);
+            updatesOnline.add(0, update.getDownloadId());
+        }
+
+        controller.setUpdatesAvailableOnline(updatesOnline, false);
+
+        controller.verifyUpdateAsync(localUpdate.getDownloadId());
+        controller.notifyUpdateChange(localUpdate.getDownloadId());
+
+        List<String> updateIds = new ArrayList<>();
+        List<UpdateInfo> sortedUpdates = controller.getUpdates();
+        if (sortedUpdates.isEmpty()) {
+            findViewById(R.id.no_new_updates_view).setVisibility(View.VISIBLE);
+            findViewById(R.id.recycler_view).setVisibility(View.GONE);
+        } else {
+            findViewById(R.id.no_new_updates_view).setVisibility(View.GONE);
+            findViewById(R.id.recycler_view).setVisibility(View.VISIBLE);
+            sortedUpdates.sort((u1, u2) -> Long.compare(u2.getTimestamp(), u1.getTimestamp()));
+            for (UpdateInfo update : sortedUpdates) {
+                updateIds.add(update.getDownloadId());
+            }
+            mAdapter.setData(updateIds);
+            mAdapter.notifyDataSetChanged();
+        }
     }
 }
